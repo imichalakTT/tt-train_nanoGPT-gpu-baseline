@@ -28,7 +28,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
 from model import GPTConfig, GPT
-
+from bf16_adamw import BF16AdamW  # Use to reproduce tt-train's training
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
@@ -60,7 +60,11 @@ max_iters = 600000 # total number of training iterations
 weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
-grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
+# grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
+# == tt-train by default doesn't use gradient clipping == 
+grad_clip = 0.0
+# Option to use bfloat16 for optimizer state (to match tt-train's default)
+use_bf16_optimizer_state = True  # Set to False for full precision optimizer stat
 # learning rate decay settings
 decay_lr = True # whether to decay the learning rate
 warmup_iters = 2000 # how many steps to warm up for
@@ -134,6 +138,9 @@ def get_batch(split):
 iter_num = 0
 best_val_loss = 1e9
 
+# == tt-train by default uses bfloat16 for everything == 
+torch.set_default_dtype(torch.bfloat16)
+
 # attempt to derive vocab_size from the dataset
 meta_path = os.path.join(data_dir, 'meta.pkl')
 meta_vocab_size = None
@@ -196,9 +203,22 @@ model.to(device)
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
 
 # optimizer
-optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
-if init_from == 'resume':
-    optimizer.load_state_dict(checkpoint['optimizer'])
+if use_bf16_optimizer_state and dtype == 'bfloat16':
+    # Use custom BF16 AdamW matching tt-train's implementation
+    print("Using custom BF16AdamW optimizer (matching tt-train)")
+    # Get parameters with proper weight decay groups
+    param_dict = {pn: p for pn, p in model.named_parameters() if p.requires_grad}
+    decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+    nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+    # Note: BF16AdamW doesn't support per-param weight decay, so we use the same for all
+    # This is a simplification - for exact match, would need separate optimizers
+    all_params = decay_params + nodecay_params
+    optimizer = BF16AdamW(all_params, lr=learning_rate, betas=(beta1, beta2), weight_decay=weight_decay)
+    print(f"num parameters: {len(all_params)}, with {sum(p.numel() for p in all_params):,} total")
+else:
+    optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
+    if init_from == 'resume':
+        optimizer.load_state_dict(checkpoint['optimizer'])
 checkpoint = None # free up memory
 
 # compile the model
@@ -308,8 +328,12 @@ while True:
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
     # step the optimizer and scaler if training in fp16
-    scaler.step(optimizer)
-    scaler.update()
+    if isinstance(optimizer, BF16AdamW):
+        # == We don't use scaler for bfloat16 and in tt-train in general ==
+        optimizer.step()
+    else:
+        scaler.step(optimizer)
+        scaler.update()
     # flush the gradients as soon as we can, no need for this memory anymore
     optimizer.zero_grad(set_to_none=True)
 
